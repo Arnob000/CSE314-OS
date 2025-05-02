@@ -1,0 +1,659 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..554b1c6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,6 +132,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_dummy\
++	$U/_testprocinfo\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..45b157c 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -106,6 +106,7 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             getpinfo(uint64);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -187,3 +188,14 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++
++
++// scheduling functions
++// proc.c
++int qone_isempty();
++int gettotaltickets();
++int rand(int);
++void reinittkt();
++void boostproc();
++void incrtime();
++void upd_clock();
+\ No newline at end of file
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..db72a67 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,7 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       2000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++#define TIME_LIMIT_1 1
++#define TIME_LIMIT_2 2
++#define BOOST_INTERVAL 64
++#define DEFAULT_TICKET_COUNT 10
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..75d69e3 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -1,10 +1,12 @@
+ #include "types.h"
+ #include "param.h"
++#include "rand.c"
+ #include "memlayout.h"
+ #include "riscv.h"
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "pstat.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -47,6 +49,7 @@ proc_mapstacks(pagetable_t kpgtbl)
+ void
+ procinit(void)
+ {
++  sgenrand(123);
+   struct proc *p;
+   
+   initlock(&pid_lock, "nextpid");
+@@ -146,6 +149,14 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  //proc info
++  p->queueno = 1;
++  p->totaltimeslot = 0;
++  p->curtimeslot = 0;
++  p->oritktcnt = DEFAULT_TICKET_COUNT;
++  p->curtktcnt = DEFAULT_TICKET_COUNT;
++  p->inuse=0;
++
+   return p;
+ }
+ 
+@@ -169,6 +180,13 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++
++  p->queueno = 1;
++  p->totaltimeslot = 0;
++  p->curtimeslot = 0;
++  p->oritktcnt = DEFAULT_TICKET_COUNT;
++  p->curtktcnt = DEFAULT_TICKET_COUNT;
++  p->inuse = 0;
+ }
+ 
+ // Create a user page table for a given process, with no user memory,
+@@ -312,6 +330,11 @@ fork(void)
+ 
+   pid = np->pid;
+ 
++  //np->queueno = 1;
++  np->oritktcnt = p->oritktcnt;
++  np->curtktcnt = np->oritktcnt;
++
++
+   release(&np->lock);
+ 
+   acquire(&wait_lock);
+@@ -446,28 +469,71 @@ scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
+-  
+   c->proc = 0;
+-  for(;;){
+-    // Avoid deadlock by ensuring that devices can interrupt.
+-    intr_on();
++  
++  for(;;) {
++      intr_on();
+ 
+-    for(p = proc; p < &proc[NPROC]; p++) {
+-      acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
++      int total = gettotaltickets();
++      if(!total) {
++        reinittkt();
++        total = gettotaltickets();
++      }
++      if(total <= 0) goto rr;
++
++      int random = rand(total) + 1;
++      int count = 0, flag = 0;
++
++      for(p = proc; p < &proc[NPROC]; p++) {
++        acquire(&p->lock);
++
++        if(p->queueno == 1 && p->state == RUNNABLE)
++          count += p->curtktcnt;
++        
++        if(count >= random) {
++          flag = 1;
++          p->state = RUNNING;
++          p->inuse = 1;
++          p->curtimeslot = 0;
++          p->curtktcnt--;
++          c->proc = p;
++          swtch(&c->context, &p->context);
++
++          c->proc = 0;
++
++          if(p->curtimeslot >= TIME_LIMIT_1 && p->state == RUNNABLE){
++            // printf("Demoting\n");
++            p->queueno = 2;
++          }
++        }
++
++        release(&p->lock); 
++        if(flag) break;
++      }
++      if(flag) continue;
++      
++      
++
++    rr:
++      //  printf("brr\n"); 
++      for(p = proc; p < &proc[NPROC]; p++) {
++        acquire(&p->lock);
++          if(p->state == RUNNABLE && p->queueno==2) {
++
++          // if(p->state == RUNNABLE){
++          p->state = RUNNING;
++          p->inuse = 1;
++          p->curtimeslot = 0;
++          c->proc = p;
++          swtch(&c->context, &p->context);
++
++          c->proc = 0;  
++
++          if(p->curtimeslot < TIME_LIMIT_2 && p->state == SLEEPING)
++            p->queueno = 1;
++        }
++        release(&p->lock);
+       }
+-      release(&p->lock);
+-    }
+   }
+ }
+ 
+@@ -504,6 +570,17 @@ yield(void)
+ {
+   struct proc *p = myproc();
+   acquire(&p->lock);
++
++  if(p->queueno == 1 && p->curtimeslot < TIME_LIMIT_1) {
++    release(&p->lock);
++    return;
++  }
++
++  if(p->queueno == 2 && p->curtimeslot < TIME_LIMIT_2) {
++    release(&p->lock);
++    return;
++  }
++
+   p->state = RUNNABLE;
+   sched();
+   release(&p->lock);
+@@ -681,3 +758,83 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++
++//proc info
++int getpinfo(uint64 stataddr){
++  struct proc *p;
++  struct pstat st;
++  int pcount=0;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    st.pid[pcount]=p->pid;
++    st.inuse[pcount]= p->state == RUNNABLE || p->state == RUNNING;
++    st.inQ[pcount]=p->queueno;
++    st.tickets_original[pcount]=p->oritktcnt;
++    st.tickets_current[pcount]=p->curtktcnt;
++    st.time_slices[pcount]=p->totaltimeslot;
++    release(&p->lock);
++    pcount++;
++  }
++  p=myproc();
++  if(copyout(p->pagetable, stataddr, (char *)&st, sizeof(st)) < 0)
++      return -1;
++
++  return 0;
++}
++
++
++int gettotaltickets(){
++    struct proc *p;
++    int tkt=0;
++    int flag = 0;
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->queueno==1 && p->state == RUNNABLE){
++        tkt+=p->curtktcnt;
++        flag = 1;
++      }
++      release(&p->lock);
++    }
++    if(!flag) return -1;
++    return tkt;
++}
++
++int rand(int bound){  
++  return genrand()%bound;
++}
++
++void reinittkt(){
++  struct proc *p;
++    for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->state==RUNNABLE)
++      p->curtktcnt=p->oritktcnt;
++    release(&p->lock);
++  }
++}
++
++void boostproc(){
++  struct proc *p;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->queueno == 2){
++      p->queueno=1;
++    }
++    release(&p->lock);
++  }
++}
++
++void
++upd_clock() {
++  struct proc *p;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->state == RUNNING) {
++      p->totaltimeslot++;
++      p->curtimeslot++;
++    }
++    release(&p->lock);
++  }
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..b21f7ea 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,13 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  
++  int queueno;    //queueno
++  int oritktcnt;  //original ticket count
++  int curtktcnt;  //current tkt count
++  int totaltimeslot;    //overall running time
++  int curtimeslot;      //current ticks
++  int inuse;      //cur running?
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/pstat.h b/kernel/pstat.h
+new file mode 100644
+index 0000000..6228a33
+--- /dev/null
++++ b/kernel/pstat.h
+@@ -0,0 +1,14 @@
++#ifndef _PSTAT_H_
++#define _PSTAT_H_
++#include "param.h"
++
++struct pstat {
++  int pid[NPROC]; // the process ID of each process
++  int inuse[NPROC]; // whether this slot of the process table is being used (1 or 0)
++  int inQ[NPROC]; // which queue the process is currently in
++  int tickets_original[NPROC]; // the number of tickets each process originally had
++  int tickets_current[NPROC]; // the number of tickets each process currently has
++  int time_slices[NPROC]; // the number of time slices each process has been scheduled
++};
++
++#endif // _PSTAT_H_
+\ No newline at end of file
+diff --git a/kernel/rand.c b/kernel/rand.c
+new file mode 100644
+index 0000000..7203926
+--- /dev/null
++++ b/kernel/rand.c
+@@ -0,0 +1,101 @@
++/* A C-program for MT19937: Real number version                */
++/*   genrand() generates one pseudorandom real number (double) */
++/* which is uniformly distributed on [0,1]-interval, for each  */
++/* call. sgenrand(seed) set initial values to the working area */
++/* of 624 words. Before genrand(), sgenrand(seed) must be      */
++/* called once. (seed is any 32-bit integer except for 0).     */
++/* Integer generator is obtained by modifying two lines.       */
++/*   Coded by Takuji Nishimura, considering the suggestions by */
++/* Topher Cooper and Marc Rieffel in July-Aug. 1997.           */
++
++/* This library is free software; you can redistribute it and/or   */
++/* modify it under the terms of the GNU Library General Public     */
++/* License as published by the Free Software Foundation; either    */
++/* version 2 of the License, or (at your option) any later         */
++/* version.                                                        */
++/* This library is distributed in the hope that it will be useful, */
++/* but WITHOUT ANY WARRANTY; without even the implied warranty of  */
++/* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.            */
++/* See the GNU Library General Public License for more details.    */
++/* You should have received a copy of the GNU Library General      */
++/* Public License along with this library; if not, write to the    */
++/* Free Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA   */ 
++/* 02111-1307  USA                                                 */
++
++/* Copyright (C) 1997 Makoto Matsumoto and Takuji Nishimura.       */
++/* Any feedback is very welcome. For any question, comments,       */
++/* see http://www.math.keio.ac.jp/matumoto/emt.html or email       */
++/* matumoto@math.keio.ac.jp   
++
++https://github.com/avaiyang/xv6-lottery-scheduling/blob/master/rand.c                                     */
++
++/* Period parameters */  
++#define N 624
++#define M 397
++#define MATRIX_A 0x9908b0df   /* constant vector a */
++#define UPPER_MASK 0x80000000 /* most significant w-r bits */
++#define LOWER_MASK 0x7fffffff /* least significant r bits */
++
++/* Tempering parameters */   
++#define TEMPERING_MASK_B 0x9d2c5680
++#define TEMPERING_MASK_C 0xefc60000
++#define TEMPERING_SHIFT_U(y)  (y >> 11)
++#define TEMPERING_SHIFT_S(y)  (y << 7)
++#define TEMPERING_SHIFT_T(y)  (y << 15)
++#define TEMPERING_SHIFT_L(y)  (y >> 18)
++
++#define RAND_MAX 0x7fffffff
++
++static unsigned long mt[N]; /* the array for the state vector  */
++static int mti=N+1; /* mti==N+1 means mt[N] is not initialized */
++
++/* initializing the array with a NONZERO seed */
++void
++sgenrand(unsigned long seed)
++{
++    /* setting initial seeds to mt[N] using         */
++    /* the generator Line 25 of Table 1 in          */
++    /* [KNUTH 1981, The Art of Computer Programming */
++    /*    Vol. 2 (2nd Ed.), pp102]                  */
++    mt[0]= seed & 0xffffffff;
++    for (mti=1; mti<N; mti++)
++        mt[mti] = (69069 * mt[mti-1]) & 0xffffffff;
++}
++
++long /* for integer generation */
++genrand()
++{
++    unsigned long y;
++    static unsigned long mag01[2]={0x0, MATRIX_A};
++    /* mag01[x] = x * MATRIX_A  for x=0,1 */
++
++    if (mti >= N) { /* generate N words at one time */
++        int kk;
++
++        if (mti == N+1)   /* if sgenrand() has not been called, */
++            sgenrand(4357); /* a default initial seed is used   */
++
++        for (kk=0;kk<N-M;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+M] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        for (;kk<N-1;kk++) {
++            y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
++            mt[kk] = mt[kk+(M-N)] ^ (y >> 1) ^ mag01[y & 0x1];
++        }
++        y = (mt[N-1]&UPPER_MASK)|(mt[0]&LOWER_MASK);
++        mt[N-1] = mt[M-1] ^ (y >> 1) ^ mag01[y & 0x1];
++
++        mti = 0;
++    }
++  
++    y = mt[mti++];
++    y ^= TEMPERING_SHIFT_U(y);
++    y ^= TEMPERING_SHIFT_S(y) & TEMPERING_MASK_B;
++    y ^= TEMPERING_SHIFT_T(y) & TEMPERING_MASK_C;
++    y ^= TEMPERING_SHIFT_L(y);
++
++    // Strip off uppermost bit because we want a long,
++    // not an unsigned long
++    return y & RAND_MAX;
++}
+\ No newline at end of file
+diff --git a/kernel/schefun.c b/kernel/schefun.c
+new file mode 100644
+index 0000000..e69de29
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..1a308da 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_settickets(void);
++extern uint64 sys_getpinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_settickets]  sys_settickets,
++[SYS_getpinfo]  sys_getpinfo,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..cede0a8 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_settickets  22  //set ticket number 
++#define SYS_getpinfo 23     // get proc stat
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..6a55214 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,36 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++//set ticket
++uint64
++sys_settickets(void){
++  int tkt;
++  struct proc *p=myproc();
++
++  argint(0, &tkt);
++  if(tkt<=0){
++    acquire(&p->lock);
++    p->oritktcnt=DEFAULT_TICKET_COUNT;
++    p->curtktcnt=DEFAULT_TICKET_COUNT;
++    release(&p->lock);
++    return -1;
++  }
++  
++  acquire(&p->lock);
++  p->curtktcnt=tkt;
++  p->oritktcnt=tkt;
++  release(&p->lock);
++  return 0;
++  
++}
++
++//get proc stat
++uint64
++sys_getpinfo(void)
++{  
++  uint64 stataddr;
++  argaddr(0, &stataddr);
++  return getpinfo(stataddr);  
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..0648612 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -165,6 +165,9 @@ clockintr()
+ {
+   acquire(&tickslock);
+   ticks++;
++  upd_clock();
++  if(ticks%BOOST_INTERVAL==0)
++      boostproc();
+   wakeup(&ticks);
+   release(&tickslock);
+ }
+diff --git a/user/dummy.c b/user/dummy.c
+new file mode 100644
+index 0000000..abe7386
+--- /dev/null
++++ b/user/dummy.c
+@@ -0,0 +1,33 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int tkt;
++  
++  if(argc > 2 || ((argv[1][0] < '0' || argv[1][0] > '9') && argc!=1)){
++    fprintf(2, "Usage1: %s ticket_number\n", argv[0]);
++    fprintf(2, "Usage2: %s\n", argv[0]);
++    exit(1);
++  }
++
++  if(argc<2){    
++    tkt=0;
++  }
++  else{
++    tkt=atoi(argv[1]);
++  }
++
++  if(settickets(tkt)<0){
++    fprintf(2, "%s: default tickets set\n", argv[0]);
++    }
++
++   // int pid=fork();
++   // fprintf(2, "%d: New proc created by fork\n", pid);
++ 
++  while(1);
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/testprocinfo.c b/user/testprocinfo.c
+new file mode 100644
+index 0000000..6947b56
+--- /dev/null
++++ b/user/testprocinfo.c
+@@ -0,0 +1,31 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  struct pstat procstat;
++  
++  if(argc > 1){
++    fprintf(2, "Usage: %s\n", argv[0]);
++    exit(1);
++  }
++
++  
++  if(getpinfo(&procstat)<0){
++      fprintf(2, "%s: fetching proc info failed\n", argv[0]);
++      exit(1);
++  }
++  
++
++  fprintf(2,"PID\t|\tIN USE\t|\tinQ\t| ORIGINAL TICKETS | CURRENT TICKETS | TIME SLICES\n");
++  for(int i=0; i<NPROC; i++){
++    if(procstat.pid[i]!=0)
++      printf("%d\t \t%d\t \t%d\t \t%d\t \t%d\t \t%d\n",procstat.pid[i],procstat.inuse[i],procstat.inQ[i],procstat.tickets_original[i], procstat.tickets_current[i],procstat.time_slices[i]);
++  }
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..64b8048 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,5 @@
+ struct stat;
++struct pstat;
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int settickets(int);
++int getpinfo(struct pstat*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..5268fc5 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("settickets");
++entry('getpinfo');
